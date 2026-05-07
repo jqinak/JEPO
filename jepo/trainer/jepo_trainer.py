@@ -163,16 +163,10 @@ def _build_metrics_glossary_lines(use_trajectory: bool) -> list[str]:
     ]
     if use_trajectory:
         lines += [
-            "【轨迹】reward/contrib_sparse_*：稀疏里程碑支路写入 token 的贡献（归一化前），mean_token=全 token 均值，sum_per_traj_mean=每条轨迹 token 和再对 batch 平均。",
-            "【轨迹】reward/contrib_dense_*：稠密每步里程碑支路（同上）。",
-            "【轨迹】reward/contrib_terminal_*：终端 bonus 支路（成功轨迹上均匀摊到所有 token）。",
-            "【轨迹】reward/contrib_*_abs_mass_share：三支路绝对值总质量占比（反映放缩后哪一支主导）。",
-            "【轨迹】reward/scale_*：配置中的稀疏/稠密/terminal 系数（terminal 禁用时 scale_terminal_bonus=0）。",
-            "【轨迹】reward/pos_cos_mean：0.5*(cos+1)，LEWM pred vs GT 嵌入余弦映射到 [0,1]。",
-            "【轨迹】reward/sparse_milestone_mean_raw / dense_micro_mean_raw：原始 cos 在对应集合上的平均。",
-            "【轨迹】reward/terminal_success_rate：末步 cos >= terminal_cos_threshold 的比例。",
-            "【轨迹】monitor/grpo_across_repeat/*：同一 base 轨迹的 rollout_n 条副本间，行均值 reward/advantage 的标准差（越大说明随机性越大）。",
-            "【轨迹】meta/*：本步数据形状（s_chunks、micro_tokens、chunks_total、batch 等）。",
+            "【Terminal 奖励】terminal/cos_mean、terminal/cos_pos_mean、terminal/success_rate：末步预测嵌入与 GT 嵌入的相似度、映射到 [0,1] 的分数、超过阈值比例。",
+            "【奖励/优势】reward/token_*、advantage/*：token 级奖励和优势的均值、标准差与极值；terminal 模式若 normalize_rewards=true，reward/token_mean 接近 0 是预期现象。",
+            "【策略稳定性】policy/kl、policy/clipfrac_*、policy/ratio_*、policy/entropy、policy/grad_norm：PPO 更新幅度、裁剪比例、探索度与梯度规模。",
+            "【生成行为】generation/*、rollout/old_log_prob_*：每步轨迹长度、rollout 副本数与采样动作在旧策略下的概率统计。",
         ]
     return lines
 
@@ -194,7 +188,7 @@ def _format_static_config_report(config, use_trajectory: bool) -> list[str]:
         OmegaConf.to_yaml(OmegaConf.create(data)).strip(),
         "--- algorithm ---",
         OmegaConf.to_yaml(OmegaConf.create(algo)).strip(),
-        "--- reward (含 trajectory 三支路与放缩) ---",
+        "--- reward (terminal 监控关注末步相似度 / 成功率 / 优势) ---",
         OmegaConf.to_yaml(OmegaConf.create(rw)).strip(),
         "--- trainer (摘录，含 log/save/wandb) ---",
         OmegaConf.to_yaml(OmegaConf.create(tr)).strip(),
@@ -222,8 +216,10 @@ def _log_trajectory_dynamic_step(
     rollout_aux: dict,
     token_stats: dict[str, float],
     advantage_extra: dict[str, float],
+    advantage_stats: dict[str, float],
+    old_log_prob_stats: dict[str, float],
 ) -> None:
-    """每步控制台：可变指标一行 + 三路贡献一行（稀疏/稠密/终端）。"""
+    """Terminal reward 专用每步控制台监控。"""
     def _gf(d: dict, k: str, default: float = float("nan")) -> float:
         v = d.get(k, default)
         try:
@@ -233,45 +229,33 @@ def _log_trajectory_dynamic_step(
 
     r = reward_out
     line1 = (
-        f"[monitor step {global_step} trajectory] "
-        f"B={b_sz} rollout_n={repeat_n} "
-        f"s_chunks={_gf(rollout_aux, 's_chunks'):.1f} n_micro_tokens={_gf(rollout_aux, 'micro_tokens'):.1f} "
-        f"rew_mean={_gf(r, 'reward_mean'):.6f} rew_std={_gf(r, 'reward_std'):.6f} "
-        f"term_succ={_gf(r, 'reward/terminal_success_rate'):.3f} "
-        f"adv_std_across_bt={advantage_extra.get('advantage/row_mean/std_across_batch', float('nan')):.4f}"
-    )
-    line2 = (
-        f"[monitor contrib pre-norm] "
-        f"sparse_mu_tok={_gf(r, 'reward/contrib_sparse_mean_token'):.6f} dense_mu_tok={_gf(r, 'reward/contrib_dense_mean_token'):.6f} "
-        f"term_mu_tok={_gf(r, 'reward/contrib_terminal_mean_token'):.6f} | "
-        f"share|S={_gf(r, 'reward/contrib_sparse_abs_mass_share'):.3f} "
-        f"D={_gf(r, 'reward/contrib_dense_abs_mass_share'):.3f} "
-        f"T={_gf(r, 'reward/contrib_terminal_abs_mass_share'):.3f} | "
-        f"scales(sz/ds/ts)={_gf(r, 'reward/scale_sparse_milestone'):.4f}/{_gf(r, 'reward/scale_dense_milestone'):.4f}/{_gf(r, 'reward/scale_terminal_bonus'):.4f}"
+        f"[terminal reward step {global_step}] "
+        f"cos={_gf(r, 'reward/terminal_cos_mean'):.4f}±{_gf(r, 'reward/terminal_cos_std'):.4f} "
+        f"pos={_gf(r, 'reward/terminal_cos_pos_mean'):.4f} "
+        f"succ={_gf(r, 'reward/terminal_success_rate'):.3f}@{_gf(r, 'reward/terminal_cos_threshold'):.2f} | "
+        f"reward_tok μ/σ={_gf(token_stats, 'reward/token_level_tensor/mean'):.4f}/{_gf(token_stats, 'reward/token_level_tensor/std'):.4f} "
+        f"adv μ/σ={_gf(advantage_stats, 'advantage/mean'):.4f}/{_gf(advantage_stats, 'advantage/std'):.4f} "
+        f"adv_bt_std={_gf(advantage_extra, 'advantage/row_mean/std_across_batch'):.4f}"
     )
     m = update_metrics
+    line2 = (
+        f"[policy stability] "
+        f"loss={_gf(m, 'actor/loss'):.4f} pg={_gf(m, 'actor/pg_loss'):.4f} "
+        f"kl={_gf(m, 'actor/ppo_kl'):.5f} "
+        f"clip={_gf(m, 'actor/pg_clipfrac'):.3f}/{_gf(m, 'actor/pg_clipfrac_lower'):.3f} "
+        f"ratio={_gf(m, 'actor/ratio_mean'):.3f}/{_gf(m, 'actor/ratio_max'):.3f} "
+        f"entropy={_gf(m, 'actor/entropy'):.4f} grad={_gf(m, 'actor/grad_norm'):.3f}"
+    )
     line3 = (
-        f"[monitor loss] total={m.get('actor/loss', float('nan')):.5f} "
-        f"avg/chunk={m.get('actor/loss_avg_per_chunk', float('nan')):.5f} "
-        f"pg={m.get('actor/pg_loss', float('nan')):.5f} "
-        f"entropy={m.get('actor/entropy', float('nan')):.5f} "
-        f"ent_coef×H={m.get('actor/entropy_coeff_times_entropy', float('nan')):.5f}"
-    )
-    line4 = (
-        f"[monitor policy] kl={m.get('actor/ppo_kl', float('nan')):.5f} "
-        f"clip_hi={m.get('actor/pg_clipfrac', float('nan')):.4f} clip_lo={m.get('actor/pg_clipfrac_lower', float('nan')):.4f} "
-        f"ratio_m={m.get('actor/ratio_mean', float('nan')):.4f} ratio_max={m.get('actor/ratio_max', float('nan')):.4f} "
-        f"ratio_raw_max={m.get('actor/ratio_raw_max', float('nan')):.4f} |grad|={m.get('actor/grad_norm', float('nan')):.5f}"
-    )
-    line5 = (
-        f"[monitor tokens] {_format_short_stats(token_stats)} "
-        f"cos_pos_mean={_gf(r, 'reward/pos_cos_mean'):.5f}"
+        f"[generation behavior] "
+        f"B={b_sz} rollout_n={repeat_n} "
+        f"chunks={_gf(rollout_aux, 's_chunks'):.1f} micro_tokens={_gf(rollout_aux, 'micro_tokens'):.1f} "
+        f"old_logp μ/σ={_gf(old_log_prob_stats, 'rollout/old_log_prob/mean'):.4f}/{_gf(old_log_prob_stats, 'rollout/old_log_prob/std'):.4f} "
+        f"ret_std={_gf(r, 'reward_std'):.4f}"
     )
     _log(line1)
     _log(line2)
     _log(line3)
-    _log(line4)
-    _log(line5)
 
 
 def _format_short_stats(d: dict[str, float], limit: int = 6) -> str:
@@ -507,6 +491,36 @@ class JEPORayTrainer:
         traj_cfg = self.config.trajectory_rollout
         a = int(self.actor_worker.action_horizon)
         tb = int(traj_cfg.get("train_batch_size", self.config.data.train_batch_size))
+        sampling_mode = str(traj_cfg.get("sampling_mode", "random_with_replacement"))
+        shuffle_each_epoch = bool(traj_cfg.get("shuffle_each_epoch", True))
+        dataset_summaries = []
+        total_trajectories = 0
+        total_transitions = 0
+        for idx, ds in enumerate(base.datasets):
+            n_traj = len(getattr(ds, "trajectory_ids", []))
+            n_steps = int(len(ds))
+            total_trajectories += n_traj
+            total_transitions += n_steps
+            ds_name = getattr(ds, "dataset_name", None) or getattr(ds, "tag", None) or f"dataset_{idx}"
+            dataset_summaries.append(f"{ds_name}: trajectories={n_traj}, transitions={n_steps}")
+        steps_per_full_pass = (total_trajectories + max(1, tb) - 1) // max(1, tb)
+        total_steps_cfg = int(self.config.trainer.total_training_steps)
+        pass_ratio = total_steps_cfg / max(1, steps_per_full_pass)
+        _log(
+            "[jepo data] "
+            f"subset={starvla_cfg.datasets.vla_data.data_mix} | "
+            f"sampling_mode={sampling_mode} shuffle_each_epoch={shuffle_each_epoch} | "
+            f"trajectory_batch_size={tb} rollout_n={int(self.config.algorithm.rollout_n)} | "
+            f"trajectories={total_trajectories} transitions={total_transitions} | "
+            f"steps_per_full_pass≈{steps_per_full_pass} current_total_steps={total_steps_cfg} "
+            f"({pass_ratio:.2f} theoretical passes)"
+        )
+        for summary in dataset_summaries:
+            _log(f"[jepo data] {summary}")
+        if sampling_mode == "sequential_epoch":
+            _log("[jepo data] 采样说明：sequential_epoch 会按轨迹列表扫完一遍；shuffle_each_epoch=true 时每轮开始先打乱。")
+        else:
+            _log("[jepo data] 采样说明：random_with_replacement 为随机带放回采样；steps_per_full_pass 仅表示按 batch 顺序扫完全部轨迹所需的理论步数。")
         it_ds = JEPOFullExpertTrajectoryIterable(
             base,
             chunk_actions=a,
@@ -515,6 +529,8 @@ class JEPORayTrainer:
             action_take_dim=int(traj_cfg.get("action_take_dim", self.actor_worker.action_dim)),
             gt_use_next_observation=bool(traj_cfg.get("gt_use_next_observation", True)),
             train_batch_size=tb,
+            sampling_mode=sampling_mode,
+            shuffle_each_epoch=shuffle_each_epoch,
         )
         return DataLoader(it_ds, batch_size=None, num_workers=0, pin_memory=False)
 
@@ -837,7 +853,9 @@ class JEPORayTrainer:
                     repeat_n = int(self.config.algorithm.rollout_n)
                     b_mon = len(traj_batch)
                     tok_st = _tensor_scalar_stats(token_level_rewards.float(), "reward/token_level_tensor")
+                    adv_st = _tensor_scalar_stats(advantages.float(), "advantage")
                     adv_ex = _tensor_advanced_stats_rowwise(advantages.float(), "advantage")
+                    old_lp_st = _tensor_scalar_stats(old_log_probs.float(), "rollout/old_log_prob")
                     _log_trajectory_dynamic_step(
                         global_step,
                         b_sz=b_mon,
@@ -847,6 +865,8 @@ class JEPORayTrainer:
                         rollout_aux=rollout_aux,
                         token_stats=tok_st,
                         advantage_extra=adv_ex,
+                        advantage_stats=adv_st,
+                        old_log_prob_stats=old_lp_st,
                     )
                     if global_step % self.log_interval == 0:
                         _log(
@@ -900,39 +920,82 @@ class JEPORayTrainer:
                     _log(f"[step {global_step}] saved checkpoint: {ckpt}")
 
                 wb: dict = {}
-                for rk, rv in reward_out.items():
-                    if rk == "token_level_rewards" or isinstance(rv, torch.Tensor):
-                        continue
-                    try:
-                        wb[str(rk).replace("/", "__")] = float(rv)
-                    except (TypeError, ValueError):
-                        pass
-                wb.update(update_metrics)
-                wb.update(_tensor_scalar_stats(token_level_rewards.float(), "reward/token_level_tensor"))
-                wb.update(_tensor_advanced_stats_rowwise(token_level_rewards.float(), "monitor/tlr"))
-                wb.update(_tensor_scalar_stats(advantages.float(), "advantage"))
-                wb.update(_tensor_advanced_stats_rowwise(advantages.float(), "monitor/adv"))
-                wb.update(_tensor_scalar_stats(returns.float(), "returns"))
-                wb.update(_tensor_advanced_stats_rowwise(returns.float(), "monitor/ret"))
-                wb.update(_tensor_scalar_stats(old_log_probs.float(), "rollout/old_log_prob"))
                 if self.use_trajectory_rollout:
-                    wb["meta/trajectory_mode"] = 1.0
-                    wb.update({f"meta/{k}": float(v) for k, v in rollout_aux.items() if isinstance(v, (int, float))})
-                    wb["meta/repeated_rollout_trajectories"] = float(repeat_n * len(traj_batch))
-                    wb.update(
-                        _grpo_repeat_dispersion(
-                            token_level_rewards,
-                            advantages,
-                            returns,
-                            len(traj_batch),
-                            int(self.config.algorithm.rollout_n),
-                        )
+                    reward_stats = _tensor_scalar_stats(token_level_rewards.float(), "reward/token_level_tensor")
+                    reward_row_stats = _tensor_advanced_stats_rowwise(token_level_rewards.float(), "reward/token_level_tensor")
+                    adv_stats = _tensor_scalar_stats(advantages.float(), "advantage")
+                    adv_row_stats = _tensor_advanced_stats_rowwise(advantages.float(), "advantage")
+                    ret_stats = _tensor_scalar_stats(returns.float(), "returns")
+                    old_lp_stats = _tensor_scalar_stats(old_log_probs.float(), "rollout/old_log_prob")
+                    repeat_stats = _grpo_repeat_dispersion(
+                        token_level_rewards,
+                        advantages,
+                        returns,
+                        len(traj_batch),
+                        int(self.config.algorithm.rollout_n),
                     )
+
+                    focused = {
+                        "terminal/cos_mean": reward_out.get("reward/terminal_cos_mean"),
+                        "terminal/cos_std": reward_out.get("reward/terminal_cos_std"),
+                        "terminal/cos_pos_mean": reward_out.get("reward/terminal_cos_pos_mean"),
+                        "terminal/success_rate": reward_out.get("reward/terminal_success_rate"),
+                        "terminal/cos_threshold": reward_out.get("reward/terminal_cos_threshold"),
+                        "reward/token_mean": reward_stats.get("reward/token_level_tensor/mean"),
+                        "reward/token_std": reward_stats.get("reward/token_level_tensor/std"),
+                        "reward/token_absmax": reward_stats.get("reward/token_level_tensor/absmax"),
+                        "reward/row_mean_std_across_batch": reward_row_stats.get("reward/token_level_tensor/row_mean/std_across_batch"),
+                        "advantage/mean": adv_stats.get("advantage/mean"),
+                        "advantage/std": adv_stats.get("advantage/std"),
+                        "advantage/absmax": adv_stats.get("advantage/absmax"),
+                        "advantage/row_mean_std_across_batch": adv_row_stats.get("advantage/row_mean/std_across_batch"),
+                        "advantage/repeat_rowmean_std": repeat_stats.get("monitor/grpo_across_repeat/adv_rowmean_std_mean"),
+                        "returns/mean": ret_stats.get("returns/mean"),
+                        "returns/std": ret_stats.get("returns/std"),
+                        "policy/loss": update_metrics.get("actor/loss"),
+                        "policy/pg_loss": update_metrics.get("actor/pg_loss"),
+                        "policy/kl": update_metrics.get("actor/ppo_kl"),
+                        "policy/clipfrac_hi": update_metrics.get("actor/pg_clipfrac"),
+                        "policy/clipfrac_lo": update_metrics.get("actor/pg_clipfrac_lower"),
+                        "policy/ratio_mean": update_metrics.get("actor/ratio_mean"),
+                        "policy/ratio_max": update_metrics.get("actor/ratio_max"),
+                        "policy/entropy": update_metrics.get("actor/entropy"),
+                        "policy/grad_norm": update_metrics.get("actor/grad_norm"),
+                        "generation/batch": float(len(traj_batch)),
+                        "generation/rollout_n": float(int(self.config.algorithm.rollout_n)),
+                        "generation/s_chunks": rollout_aux.get("s_chunks"),
+                        "generation/micro_tokens": rollout_aux.get("micro_tokens"),
+                        "rollout/old_log_prob_mean": old_lp_stats.get("rollout/old_log_prob/mean"),
+                        "rollout/old_log_prob_std": old_lp_stats.get("rollout/old_log_prob/std"),
+                        "meta/trajectory_mode": 1.0,
+                    }
+                    for key, value in focused.items():
+                        try:
+                            wb[key] = float(value)
+                        except (TypeError, ValueError):
+                            pass
+                    wb["meta/trajectory_mode"] = 1.0
+                    wb["meta/repeated_rollout_trajectories"] = float(repeat_n * len(traj_batch))
                     if bool(self.config.trainer.get("wandb_histograms", True)):
                         wb.update(_histogram_payload("hist/token_level_reward", token_level_rewards))
                         wb.update(_histogram_payload("hist/advantage", advantages))
                         wb.update(_histogram_payload("hist/returns", returns))
                 else:
+                    for rk, rv in reward_out.items():
+                        if rk == "token_level_rewards" or isinstance(rv, torch.Tensor):
+                            continue
+                        try:
+                            wb[str(rk).replace("/", "__")] = float(rv)
+                        except (TypeError, ValueError):
+                            pass
+                    wb.update(update_metrics)
+                    wb.update(_tensor_scalar_stats(token_level_rewards.float(), "reward/token_level_tensor"))
+                    wb.update(_tensor_advanced_stats_rowwise(token_level_rewards.float(), "monitor/tlr"))
+                    wb.update(_tensor_scalar_stats(advantages.float(), "advantage"))
+                    wb.update(_tensor_advanced_stats_rowwise(advantages.float(), "monitor/adv"))
+                    wb.update(_tensor_scalar_stats(returns.float(), "returns"))
+                    wb.update(_tensor_advanced_stats_rowwise(returns.float(), "monitor/ret"))
+                    wb.update(_tensor_scalar_stats(old_log_probs.float(), "rollout/old_log_prob"))
                     pa = rollout["predicted_actions"]
                     wb["meta/base_batch"] = float(len(examples))
                     wb["meta/repeated_batch"] = float(len(repeated_examples))

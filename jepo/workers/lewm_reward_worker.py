@@ -440,6 +440,8 @@ class JEPOLewmRewardWorker:
             gt_embs.gather(1, gather_idx + gt_offset).squeeze(1),
         )
         step_mask = _valid_step_mask(response_mask_dev, action_dim, pred_embs.dtype).to(device=self.device)
+        terminal_threshold = float(jepo_cfg.get("terminal_cos_threshold", 0.85))
+        terminal_success = (term_cos >= terminal_threshold).to(dtype=term_cos.dtype)
 
         token_flat = token_rewards.detach().cpu()
         valid_mass = response_mask_dev.sum(dim=-1).clamp_min(1.0)
@@ -465,6 +467,9 @@ class JEPOLewmRewardWorker:
             else 0.0,
             "reward/terminal_cos_mean": float(term_cos.mean().detach().cpu()),
             "reward/terminal_cos_std": float(term_cos.std(unbiased=False).detach().cpu()),
+            "reward/terminal_cos_pos_mean": float(((term_cos + 1.0) * 0.5).mean().detach().cpu()),
+            "reward/terminal_success_rate": float(terminal_success.mean().detach().cpu()),
+            "reward/terminal_cos_threshold": terminal_threshold,
             "reward/n_micro_steps_mean": float(n_micro.float().mean().detach().cpu()),
             "reward/n_micro_steps_min": float(n_micro.float().min().detach().cpu()),
             "reward/n_micro_steps_max": float(n_micro.float().max().detach().cpu()),

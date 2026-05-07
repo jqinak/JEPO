@@ -8,14 +8,14 @@ paths:
   starvla_repo: /project/peilab/qjl/2026/JEPO
   lewm_cfg_path: /project/peilab/qjl/2026/JEPO/config/lewm.yaml
   lewm_repo: /project/peilab/qjl/2026/JEPO/lewm
-  starvla_ckpt: /project/peilab/qjl/2026/JEPO/playground/vla/finalmodel/steps_1000_pytorch_model.pt
+  starvla_ckpt: /project/peilab/qjl/2026/JEPO/playground/vla/finalmodel/steps_10000_pytorch_model.pt
   lewm_ckpt: /project/peilab/qjl/2026/JEPO/playground/wm/embodied_lewm_stage3.ckpt
 
 data:
   dataloader_type: starvla_lerobot
   starvla_cfg: /project/peilab/qjl/2026/JEPO/config/qwen35vlPI_libero.yaml
   # 可用命令行覆盖，例如 data.libero_subset=libero_spatial/libero_object/libero_goal/libero_10
-  libero_subset: libero_goal
+  libero_subset: libero_object
   train_batch_size: 1
   num_workers: 0
   max_steps: 1000
@@ -60,7 +60,9 @@ reward:
 
 trajectory_rollout:
   enabled: true
-  train_batch_size: 8
+  train_batch_size: 1
+  sampling_mode: sequential_epoch  # sequential_epoch / random_with_replacement
+  shuffle_each_epoch: true
   max_sample_tries: 512
   action_take_dim: 7
   gt_use_next_observation: true
