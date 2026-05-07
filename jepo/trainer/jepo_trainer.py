@@ -253,9 +253,18 @@ def _log_trajectory_dynamic_step(
         f"old_logp μ/σ={_gf(old_log_prob_stats, 'rollout/old_log_prob/mean'):.4f}/{_gf(old_log_prob_stats, 'rollout/old_log_prob/std'):.4f} "
         f"ret_std={_gf(r, 'reward_std'):.4f}"
     )
+    line4 = (
+        f"[terminal diagnostics] "
+        f"gt_cos={_gf(r, 'diag/gt_terminal_cos_mean'):.4f} "
+        f"gt_succ={_gf(r, 'diag/gt_terminal_success_rate'):.3f} | "
+        f"actor_sigma={_gf(r, 'diag/actor_small_sigma_scale'):.4f} "
+        f"actor_cos={_gf(r, 'diag/actor_terminal_cos_mean'):.4f} "
+        f"actor_succ={_gf(r, 'diag/actor_terminal_success_rate'):.3f}"
+    )
     _log(line1)
     _log(line2)
     _log(line3)
+    _log(line4)
 
 
 def _format_short_stats(d: dict[str, float], limit: int = 6) -> str:
@@ -765,6 +774,62 @@ class JEPORayTrainer:
             chunk_actions=a,
             rollout_n=repeat_n,
         )
+        if bool(traj_roll_cfg.get("diagnostic_terminal_eval", True)):
+            gt_diag = self.reward_worker.compute_jepo_trajectory_rewards(
+                expert_views_base,
+                gt_micro_base,
+                base_masks,
+                gt_micro_actions=gt_micro_base,
+                chunk_actions=a,
+                rollout_n=1,
+            )
+            reward_out.update(
+                {
+                    "diag/gt_terminal_cos_mean": gt_diag.get("reward/terminal_cos_mean"),
+                    "diag/gt_terminal_cos_std": gt_diag.get("reward/terminal_cos_std"),
+                    "diag/gt_terminal_cos_pos_mean": gt_diag.get("reward/terminal_cos_pos_mean"),
+                    "diag/gt_terminal_success_rate": gt_diag.get("reward/terminal_success_rate"),
+                }
+            )
+
+            diag_sigma_scale = float(traj_roll_cfg.get("diagnostic_actor_sigma_scale", 0.0))
+            diag_pred_rows: list[torch.Tensor] = []
+            for bi, item in enumerate(traj_batch):
+                chunk_flat = list(item["chunk_examples"])
+                diag_noise = self.actor_worker.sample_noise_for_chunks(chunk_flat)
+                diag_roll = self.actor_worker.generate_actions_chunk_flat(
+                    chunk_flat,
+                    diag_noise,
+                    sigma_scale=diag_sigma_scale,
+                )
+                diag_micro_1d = _chunks_to_micro_tensor(
+                    diag_roll["predicted_actions"].float(),
+                    s_chunks=s_chunks[bi],
+                    chunk_actions=a,
+                    n_micro=n_micro[bi],
+                )
+                diag_pred_pad = torch.zeros(t_max, d, dtype=torch.float32)
+                diag_pred_pad[: n_micro[bi]] = diag_micro_1d
+                diag_pred_rows.append(diag_pred_pad)
+
+            diag_pred_micro = torch.stack(diag_pred_rows, dim=0)
+            actor_diag = self.reward_worker.compute_jepo_trajectory_rewards(
+                expert_views_base,
+                diag_pred_micro,
+                base_masks,
+                gt_micro_actions=gt_micro_base,
+                chunk_actions=a,
+                rollout_n=1,
+            )
+            reward_out.update(
+                {
+                    "diag/actor_small_sigma_scale": diag_sigma_scale,
+                    "diag/actor_terminal_cos_mean": actor_diag.get("reward/terminal_cos_mean"),
+                    "diag/actor_terminal_cos_std": actor_diag.get("reward/terminal_cos_std"),
+                    "diag/actor_terminal_cos_pos_mean": actor_diag.get("reward/terminal_cos_pos_mean"),
+                    "diag/actor_terminal_success_rate": actor_diag.get("reward/terminal_success_rate"),
+                }
+            )
         token_ordered = reward_out["token_level_rewards"].detach().cpu().float()
         if token_ordered.shape != response_mask_bt.shape:
             raise RuntimeError(f"reward shape {tuple(token_ordered.shape)} != response_mask {tuple(response_mask_bt.shape)}")
@@ -941,6 +1006,15 @@ class JEPORayTrainer:
                         "terminal/cos_pos_mean": reward_out.get("reward/terminal_cos_pos_mean"),
                         "terminal/success_rate": reward_out.get("reward/terminal_success_rate"),
                         "terminal/cos_threshold": reward_out.get("reward/terminal_cos_threshold"),
+                        "diagnostic/gt_terminal_cos_mean": reward_out.get("diag/gt_terminal_cos_mean"),
+                        "diagnostic/gt_terminal_cos_std": reward_out.get("diag/gt_terminal_cos_std"),
+                        "diagnostic/gt_terminal_cos_pos_mean": reward_out.get("diag/gt_terminal_cos_pos_mean"),
+                        "diagnostic/gt_terminal_success_rate": reward_out.get("diag/gt_terminal_success_rate"),
+                        "diagnostic/actor_small_sigma_scale": reward_out.get("diag/actor_small_sigma_scale"),
+                        "diagnostic/actor_terminal_cos_mean": reward_out.get("diag/actor_terminal_cos_mean"),
+                        "diagnostic/actor_terminal_cos_std": reward_out.get("diag/actor_terminal_cos_std"),
+                        "diagnostic/actor_terminal_cos_pos_mean": reward_out.get("diag/actor_terminal_cos_pos_mean"),
+                        "diagnostic/actor_terminal_success_rate": reward_out.get("diag/actor_terminal_success_rate"),
                         "reward/token_mean": reward_stats.get("reward/token_level_tensor/mean"),
                         "reward/token_std": reward_stats.get("reward/token_level_tensor/std"),
                         "reward/token_absmax": reward_stats.get("reward/token_level_tensor/absmax"),

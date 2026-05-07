@@ -179,7 +179,13 @@ class ActorRolloutWorker:
             len(chunk_examples_flat), self.action_horizon, self.action_dim, dtype=torch.float32
         ).cpu()
 
-    def generate_actions(self, examples: list[dict], noise: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+    def generate_actions(
+        self,
+        examples: list[dict],
+        noise: torch.Tensor | None = None,
+        *,
+        sigma_scale: float = 1.0,
+    ) -> dict[str, torch.Tensor]:
         examples = self.bridge.normalize_examples(examples)
         ctx = self._encode_examples(examples, require_grad=False)
         batch_size = len(examples)
@@ -200,8 +206,11 @@ class ActorRolloutWorker:
                 flow = self._predict_velocity(ctx, curr, t_scalar)
                 mean_next = curr + dt * flow
                 std, _ = self.sigma_net(pooled_ctx=ctx.pooled_ctx, noisy_actions=curr, t_scalar=t_scalar, state=ctx.state)
-                dist = Normal(mean_next.float(), std.float().clamp_min(1e-6))
-                curr = dist.sample().to(curr.dtype)
+                if sigma_scale <= 0.0:
+                    curr = mean_next.to(curr.dtype)
+                else:
+                    dist = Normal(mean_next.float(), (std.float() * float(sigma_scale)).clamp_min(1e-6))
+                    curr = dist.sample().to(curr.dtype)
                 x_chain[:, k + 1] = curr
                 time += dt
         return {"predicted_actions": curr.detach().cpu(), "x_chain": x_chain.detach().cpu(), "noise": noise.detach().cpu()}
@@ -340,8 +349,14 @@ class ActorRolloutWorker:
             out[k] = float(sum(m[k] for m in metrics_accum) / len(metrics_accum))
         return out
 
-    def generate_actions_chunk_flat(self, flat_chunk_examples: list[dict], noise: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self.generate_actions(flat_chunk_examples, noise=noise)
+    def generate_actions_chunk_flat(
+        self,
+        flat_chunk_examples: list[dict],
+        noise: torch.Tensor,
+        *,
+        sigma_scale: float = 1.0,
+    ) -> dict[str, torch.Tensor]:
+        return self.generate_actions(flat_chunk_examples, noise=noise, sigma_scale=sigma_scale)
 
     def update_actor_trajectory_chunks(
         self,

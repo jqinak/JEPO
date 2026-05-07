@@ -66,6 +66,8 @@ trajectory_rollout:
   max_sample_tries: 512
   action_take_dim: 7
   gt_use_next_observation: true
+  diagnostic_terminal_eval: true
+  diagnostic_actor_sigma_scale: 0.0  # 0 means deterministic mean update; use e.g. 0.01 for tiny sigma sampling
 
 trainer:
   total_training_steps: 400
