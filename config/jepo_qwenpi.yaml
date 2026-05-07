@@ -1,0 +1,81 @@
+runtime:
+  use_ray: false
+  seed: 42
+  device: cuda
+  smoke_random_init: false
+
+paths:
+  starvla_repo: /project/peilab/qjl/2026/JEPO
+  lewm_cfg_path: /project/peilab/qjl/2026/JEPO/config/lewm.yaml
+  lewm_repo: /project/peilab/qjl/2026/JEPO/lewm
+  starvla_ckpt: /project/peilab/qjl/2026/JEPO/playground/vla/finalmodel/steps_1000_pytorch_model.pt
+  lewm_ckpt: /project/peilab/qjl/2026/JEPO/playground/wm/embodied_lewm_stage3.ckpt
+
+data:
+  dataloader_type: starvla_lerobot
+  starvla_cfg: /project/peilab/qjl/2026/JEPO/config/qwen35vlPI_libero.yaml
+  # 可用命令行覆盖，例如 data.libero_subset=libero_spatial/libero_object/libero_goal/libero_10
+  libero_subset: libero_goal
+  train_batch_size: 1
+  num_workers: 0
+  max_steps: 1000
+
+algorithm:
+  rollout_n: 4
+  num_flow_steps: 10
+  ppo_epochs: 1
+  ppo_mini_batch_size: 0
+  normalize_advantage: true
+  adv_norm_mode: group
+  adv_norm_eps: 1e-6
+  clip_ratio: 0.2
+  target_kl: 0.1
+  kl_stop_on_exceed: false
+  max_ratio_guard: 20.0
+  entropy_coeff: 0.001
+  actor_lr: 1e-6
+  sigma_lr: 1e-5
+  max_grad_norm: 1.0
+  adv_estimator: grpo
+  gamma: 1.0
+  lam: 1.0
+  sigma_net:
+    hidden_dim: 1024
+    num_layers: 4
+    num_heads: 8
+    min_std: 0.02
+    max_std: 0.30
+    dropout: 0.0
+
+reward:
+  fallback_to_action_embedding: false
+  strict_lewm_load: true
+  min_param_load_ratio: 0.90
+  jepo:
+    reward_type: terminal
+    action_horizon: 8
+    action_dim: 7
+    gt_use_next_observation: true
+    normalize_rewards: true
+
+trajectory_rollout:
+  enabled: true
+  train_batch_size: 8
+  max_sample_tries: 512
+  action_take_dim: 7
+  gt_use_next_observation: true
+
+trainer:
+  total_training_steps: 400
+  auto_resume: true
+  min_reward_std: 1e-6
+  min_reward_std_trajectory: 0.0
+  log_interval: 10
+  metrics_jsonl: true
+  wandb_histograms: true
+  save_interval: 100
+  output_dir: /project/peilab/qjl/2026/JEPO/checkpoints/jepo_qwenpi
+  wandb:
+    enabled: true
+    entity: jqinak-hkust
+    project: qwenPI_jepo
