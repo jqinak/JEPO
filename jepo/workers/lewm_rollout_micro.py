@@ -1,4 +1,4 @@
-"""LEWM autoregressive micro-step embedding rollout (initialized from first observation only)."""
+"""LEWM autoregressive micro-step embedding rollout."""
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
 def _pad_time_left(seq: torch.Tensor, target_len: int, pad_pattern: str = "repeat_first") -> torch.Tensor:
@@ -103,6 +106,59 @@ def predict_micro_emb_sequence_open_loop(
     return torch.stack(preds, dim=1)
 
 
+def predict_micro_emb_sequence_from_gt_history(
+    model: Any,
+    gt_embs_btd: torch.Tensor,
+    micro_actions_bnad: torch.Tensor,
+    history_size: int,
+    *,
+    gt_offset: int = 1,
+) -> torch.Tensor:
+    """Roll LEWM like ``wmrl/lewm/eval``: bootstrap with GT embedding history.
+
+    ``pred_embs[:, k]`` is aligned with ``gt_embs_btd[:, k + gt_offset]``. For
+    the first ``history_size - gt_offset`` action slots there is not enough GT
+    history to form the eval-style context, so those rows are placeholders and
+    should be masked out by the caller. With next-observation alignment and
+    ``history_size=3``, prediction starts at action index 2.
+    """
+    b, n_micro, _ = micro_actions_bnad.shape
+    h = int(history_size)
+    offset = int(gt_offset)
+    if h < 1:
+        raise ValueError(f"history_size must be >= 1, got {history_size}")
+    if offset not in (0, 1):
+        raise ValueError(f"gt_offset must be 0 or 1, got {gt_offset}")
+    if gt_embs_btd.shape[0] != b:
+        raise ValueError(f"gt embedding batch {gt_embs_btd.shape[0]} != action batch {b}")
+    if gt_embs_btd.shape[1] < n_micro + offset:
+        raise ValueError(
+            f"gt embeddings T={gt_embs_btd.shape[1]} too short for n_micro={n_micro}, gt_offset={offset}"
+        )
+    if gt_embs_btd.shape[1] < h:
+        raise ValueError(f"gt embeddings T={gt_embs_btd.shape[1]} < history_size={h}")
+
+    start_k = max(0, h - offset)
+    preds = gt_embs_btd.new_zeros(b, n_micro, gt_embs_btd.shape[-1])
+    emb_chain = gt_embs_btd[:, :h, :].contiguous().clone()
+
+    for k in range(start_k, n_micro):
+        a_start = k + offset - h
+        a_end = k + offset
+        if a_start < 0:
+            raise RuntimeError(f"invalid action history start {a_start} for k={k}, offset={offset}, h={h}")
+        act_hist = micro_actions_bnad[:, a_start:a_end, :].contiguous()
+        if act_hist.shape[1] != h:
+            raise RuntimeError(f"action history length {act_hist.shape[1]} != history_size={h}")
+        act_emb_hist = model.action_encoder(act_hist)
+        emb_hist = emb_chain[:, -h:, :]
+        pred_step = model.predict(emb_hist, act_emb_hist)[:, -1:, :]
+        preds[:, k : k + 1, :] = pred_step
+        emb_chain = torch.cat([emb_chain, pred_step], dim=1)
+
+    return preds
+
+
 def _torch_or_numpy_to_float_chw_rgb(im_3hwc_or_chw: np.ndarray | torch.Tensor) -> torch.Tensor:
     """Normalize a single-frame array/tensor to CHW RGB float."""
     if isinstance(im_3hwc_or_chw, torch.Tensor):
@@ -131,8 +187,8 @@ def _torch_or_numpy_to_float_chw_rgb(im_3hwc_or_chw: np.ndarray | torch.Tensor) 
     return chw
 
 
-def _prep_frame_chw01(im: Any, image_size: int) -> torch.Tensor:
-    """One frame → ``[3, image_size, image_size]`` float in ``[0, 1]``."""
+def _prep_frame_chw(im: Any, image_size: int, *, imagenet_normalize: bool = True) -> torch.Tensor:
+    """One frame -> ``[3, image_size, image_size]`` float, matching LEWM eval preprocessing."""
     if isinstance(im, Image.Image):
         arr = np.asarray(im.convert("RGB"))
         chw = torch.from_numpy(arr).permute(2, 0, 1).float()
@@ -140,9 +196,14 @@ def _prep_frame_chw01(im: Any, image_size: int) -> torch.Tensor:
         chw = _torch_or_numpy_to_float_chw_rgb(im)
     if float(chw.max()) > 1.0:
         chw = chw / 255.0
-    return F.interpolate(chw.unsqueeze(0), size=(image_size, image_size), mode="bilinear", align_corners=False).squeeze(
+    chw = F.interpolate(chw.unsqueeze(0), size=(image_size, image_size), mode="bilinear", align_corners=False).squeeze(
         0
     )
+    if imagenet_normalize:
+        mean = _IMAGENET_MEAN.to(dtype=chw.dtype, device=chw.device)
+        std = _IMAGENET_STD.to(dtype=chw.dtype, device=chw.device)
+        chw = (chw - mean) / std
+    return chw
 
 
 def pil_batch_to_pixels_btc(
@@ -153,8 +214,9 @@ def pil_batch_to_pixels_btc(
     *,
     expected_batch: int | None = None,
     expected_time: int | None = None,
+    imagenet_normalize: bool = True,
 ) -> torch.Tensor:
-    """``batches_of_lists[b][t]`` frame → tensor ``[B, T, 3, H, W]`` in ``[0, 1]``.
+    """``batches_of_lists[b][t]`` frame -> tensor ``[B, T, 3, H, W]``.
 
     **Contract:** outer = batch trajectory index (same order as ``predicted_micro_actions``),
     inner = micro-step time, length ``num_micro_steps`` plus one when using next-frame GT observations.
@@ -176,7 +238,7 @@ def pil_batch_to_pixels_btc(
                 "Each trajectory must be a list/tuple of frames (or one H×W×C image/tensor). "
                 f"Got {type(views)}."
             )
-        chw_rows = [_prep_frame_chw01(im, image_size) for im in views_it]
+        chw_rows = [_prep_frame_chw(im, image_size, imagenet_normalize=imagenet_normalize) for im in views_it]
         out_rows.append(torch.stack(chw_rows, dim=0))
     stacked = torch.stack(out_rows, dim=0).to(device=device, dtype=dtype)
     if stacked.ndim != 5:

@@ -8,6 +8,8 @@ paths:
   starvla_repo: /project/peilab/qjl/2026/JEPO
   lewm_cfg_path: /project/peilab/qjl/2026/JEPO/config/lewm.yaml
   lewm_repo: /project/peilab/qjl/2026/JEPO/lewm
+  lewm_stats_repo: /project/peilab/qjl/2026/wmrl/lewm
+  lewm_eval_cfg_path: /project/peilab/qjl/2026/wmrl/lewm/eval/eval_outputs/libero_embed_eval/embodied_lewm_stage3/run_config.yaml
   starvla_ckpt: /project/peilab/qjl/2026/JEPO/playground/vla/finalmodel/steps_10000_pytorch_model.pt
   lewm_ckpt: /project/peilab/qjl/2026/JEPO/playground/wm/embodied_lewm_stage3.ckpt
 
@@ -57,6 +59,13 @@ reward:
     action_dim: 7
     gt_use_next_observation: true
     normalize_rewards: true
+    imagenet_normalize: true
+    diagnostic_gt_action_cos: true
+    action_normalizer:
+      enabled: true
+      strict: true
+      mean: [0.06278156489133835, 0.08684081584215164, -0.09037306904792786, 0.0005407431744970381, 0.005643379874527454, -0.005229098256677389, -0.0496407225728035]
+      std: [0.335524320602417, 0.37844768166542053, 0.44472941756248474, 0.03924361243844032, 0.06339307874441147, 0.07797042280435562, 0.9987689852714539]
 
 trajectory_rollout:
   enabled: true
@@ -67,7 +76,7 @@ trajectory_rollout:
   action_take_dim: 7
   gt_use_next_observation: true
   diagnostic_terminal_eval: true
-  diagnostic_actor_sigma_scale: 0.0  # 0 means deterministic mean update; use e.g. 0.01 for tiny sigma sampling
+  diagnostic_actor_sigma_scale: 1.0  # 0 means deterministic mean update; use e.g. 0.01 for tiny sigma sampling
 
 trainer:
   total_training_steps: 400

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
@@ -215,7 +218,10 @@ class JEPOLewmRewardWorker:
         self.use_fallback = bool(config.reward.fallback_to_action_embedding)
         self.strict_load = bool(config.reward.get("strict_lewm_load", True))
         self.min_load_ratio = float(config.reward.get("min_param_load_ratio", 0.90))
+        self.action_mean: torch.Tensor | None = None
+        self.action_std: torch.Tensor | None = None
         self._try_load_lewm()
+        self._try_load_action_normalizer()
 
     def _try_load_lewm(self):
         if self.smoke_random_init:
@@ -295,6 +301,71 @@ class JEPOLewmRewardWorker:
                 f"missing={len(missing)}, unexpected={len(unexpected)}"
             )
 
+    def _try_load_action_normalizer(self) -> None:
+        jepo_cfg = OmegaConf.select(self.config, "reward.jepo") or OmegaConf.create({})
+        norm_cfg = jepo_cfg.get("action_normalizer", None)
+        if norm_cfg is None:
+            norm_cfg = OmegaConf.create({"enabled": False})
+        if not bool(norm_cfg.get("enabled", False)):
+            return
+
+        strict = bool(norm_cfg.get("strict", True))
+        try:
+            if norm_cfg.get("mean", None) is not None and norm_cfg.get("std", None) is not None:
+                mean = torch.as_tensor(OmegaConf.to_container(norm_cfg.mean, resolve=True), dtype=torch.float32)
+                std = torch.as_tensor(OmegaConf.to_container(norm_cfg.std, resolve=True), dtype=torch.float32)
+            else:
+                mean, std = self._build_action_stats_from_lewm_eval_cfg(norm_cfg)
+            mean = mean.reshape(1, 1, -1)
+            std = std.reshape(1, 1, -1)
+            std = torch.where(std == 0, torch.ones_like(std), std)
+            self.action_mean = mean
+            self.action_std = std
+            print(f"[LEWM] action normalizer enabled: dim={mean.shape[-1]}")
+        except Exception as e:
+            if strict:
+                raise RuntimeError(f"Failed to initialize LEWM action normalizer: {e}") from e
+            print(f"[LEWM] action normalizer disabled after init failure: {e}")
+
+    def _build_action_stats_from_lewm_eval_cfg(self, norm_cfg: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        eval_cfg_path = norm_cfg.get("eval_cfg_path", None) or self.config.paths.get("lewm_eval_cfg_path", None)
+        if eval_cfg_path is None:
+            raise ValueError("reward.jepo.action_normalizer.eval_cfg_path or paths.lewm_eval_cfg_path is required")
+        eval_cfg_path = Path(str(eval_cfg_path)).expanduser().resolve()
+        eval_cfg = OmegaConf.load(str(eval_cfg_path))
+
+        lewm_repo_raw = (
+            norm_cfg.get("lewm_repo", None)
+            or self.config.paths.get("lewm_stats_repo", None)
+            or self.config.paths.lewm_repo
+        )
+        lewm_repo = Path(str(lewm_repo_raw)).expanduser().resolve()
+        libero_dataset_py = lewm_repo / "libero_dataset.py"
+        if not libero_dataset_py.exists():
+            raise FileNotFoundError(f"Cannot find LEWM libero_dataset.py for action stats: {libero_dataset_py}")
+        if str(lewm_repo) not in sys.path:
+            sys.path.insert(0, str(lewm_repo))
+        spec = importlib.util.spec_from_file_location("_jepo_lewm_libero_dataset_for_stats", libero_dataset_py)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot import LEWM libero_dataset.py from {libero_dataset_py}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        dataset_cfg = OmegaConf.to_container(eval_cfg.data.dataset, resolve=True)
+        dataset_type = dataset_cfg.pop("type", "libero")
+        if dataset_type != "libero":
+            raise ValueError(f"Action normalizer expects a libero eval dataset, got {dataset_type!r}")
+        dataset = module.LiberoParquetDataset(**dataset_cfg, transform=None)
+
+        col_data = dataset.get_col_data("action")
+        data = torch.from_numpy(np.array(col_data)).float()
+        data = data[~torch.isnan(data).any(dim=1)]
+        if data.numel() == 0:
+            raise ValueError(f"No finite action rows found from eval cfg {eval_cfg_path}")
+        mean = data.mean(0).clone()
+        std = data.std(0).clone()
+        std = torch.where(std == 0, torch.ones_like(std), std)
+        return mean, std
+
     def _build_jepa_from_config(self):
         from omegaconf import OmegaConf
         from transformers import ViTConfig, ViTModel
@@ -354,6 +425,19 @@ class JEPOLewmRewardWorker:
             return F.pad(actions, (0, exp_dim - cur_dim))
         return actions[..., :exp_dim]
 
+    def _prepare_lewm_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        actions = self._match_action_dim(actions)
+        if self.action_mean is None or self.action_std is None:
+            return actions
+        mean = self.action_mean.to(device=actions.device, dtype=actions.dtype)
+        std = self.action_std.to(device=actions.device, dtype=actions.dtype)
+        if actions.shape[-1] != mean.shape[-1]:
+            raise ValueError(
+                f"LEWM action normalizer dim {mean.shape[-1]} != action dim {actions.shape[-1]} "
+                "(check eval dataset frameskip/action_dim vs JEPO action_take_dim)."
+            )
+        return (actions - mean) / std
+
     @staticmethod
     def _pad_views_to_time(expert_views_per_traj: list[list[Any]], expected_time: int) -> list[list[Any]]:
         padded: list[list[Any]] = []
@@ -389,13 +473,14 @@ class JEPOLewmRewardWorker:
 
         reward_field = predicted_micro_actions.to(self.device)
         response_mask_dev = response_mask.to(device=self.device, dtype=reward_field.dtype)
+        gt_action_pred_embs = None
 
         if self.model is not None:
             from jepo.workers.lewm_rollout_micro import (
                 coerce_pixels_btc_hw,
                 encode_pixels_bt,
                 pil_batch_to_pixels_btc,
-                predict_micro_emb_sequence_open_loop,
+                predict_micro_emb_sequence_from_gt_history,
             )
 
             expect_t = t_max + (1 if gt_use_next else 0)
@@ -406,19 +491,31 @@ class JEPOLewmRewardWorker:
                 self.device,
                 expected_batch=b_base,
                 expected_time=expect_t,
+                imagenet_normalize=bool(jepo_cfg.get("imagenet_normalize", True)),
             )
             gt_pixels_base = coerce_pixels_btc_hw(gt_pixels_base, batch_b=b_base, time_t=expect_t)
             with torch.no_grad():
                 gt_embs_base = encode_pixels_bt(self.model, gt_pixels_base.float())
-                first_chw = gt_pixels_base[:, 0].contiguous().float().repeat_interleave(int(rollout_n), dim=0)
-                pred_act_micro = self._match_action_dim(reward_field.float())
-                pred_embs = predict_micro_emb_sequence_open_loop(
+                gt_embs = gt_embs_base.repeat_interleave(int(rollout_n), dim=0)
+                pred_act_micro = self._prepare_lewm_actions(reward_field.float())
+                pred_embs = predict_micro_emb_sequence_from_gt_history(
                     self.model,
-                    first_chw,
+                    gt_embs,
                     pred_act_micro,
                     self.history_size,
+                    gt_offset=1 if gt_use_next else 0,
                 )
-                gt_embs = gt_embs_base.repeat_interleave(int(rollout_n), dim=0)
+                if gt_micro_actions is not None and bool(jepo_cfg.get("diagnostic_gt_action_cos", True)):
+                    gt_act_base = gt_micro_actions.to(self.device, dtype=reward_field.dtype)
+                    gt_act_rep = gt_act_base.repeat_interleave(int(rollout_n), dim=0)
+                    gt_act_micro = self._prepare_lewm_actions(gt_act_rep.float())
+                    gt_action_pred_embs = predict_micro_emb_sequence_from_gt_history(
+                        self.model,
+                        gt_embs,
+                        gt_act_micro,
+                        self.history_size,
+                        gt_offset=1 if gt_use_next else 0,
+                    )
         elif self.use_fallback:
             pred_embs = reward_field.float()
             if gt_micro_actions is None:
@@ -433,12 +530,33 @@ class JEPOLewmRewardWorker:
 
         n_micro = _infer_n_micro(response_mask_dev, action_dim).to(device=self.device)
         gt_offset = 1 if gt_use_next else 0
+        warmup_steps = max(0, int(self.history_size) - int(gt_offset))
+        if bool((n_micro <= warmup_steps).any()):
+            raise ValueError(
+                f"n_micro values must exceed LEWM warmup_steps={warmup_steps}; got {n_micro.detach().cpu().tolist()}"
+            )
+        if warmup_steps > 0:
+            warmup_step_mask = torch.ones(
+                response_mask_dev.shape[0],
+                pred_embs.shape[1],
+                device=self.device,
+                dtype=token_rewards.dtype,
+            )
+            warmup_step_mask[:, :warmup_steps] = 0.0
+            warmup_token_mask = warmup_step_mask.unsqueeze(-1).expand(-1, -1, action_dim).reshape_as(token_rewards)
+            token_rewards = token_rewards * warmup_token_mask
         terminal_idx = n_micro - 1
         gather_idx = terminal_idx.view(b_total, 1, 1).expand(b_total, 1, pred_embs.shape[-1])
         term_cos = _cosine_sim(
             pred_embs.gather(1, gather_idx).squeeze(1),
             gt_embs.gather(1, gather_idx + gt_offset).squeeze(1),
         )
+        gt_action_term_cos = None
+        if gt_action_pred_embs is not None:
+            gt_action_term_cos = _cosine_sim(
+                gt_action_pred_embs.gather(1, gather_idx).squeeze(1),
+                gt_embs.gather(1, gather_idx + gt_offset).squeeze(1),
+            )
         step_mask = _valid_step_mask(response_mask_dev, action_dim, pred_embs.dtype).to(device=self.device)
         terminal_threshold = float(jepo_cfg.get("terminal_cos_threshold", 0.85))
         terminal_success = (term_cos >= terminal_threshold).to(dtype=term_cos.dtype)
@@ -473,7 +591,21 @@ class JEPOLewmRewardWorker:
             "reward/n_micro_steps_mean": float(n_micro.float().mean().detach().cpu()),
             "reward/n_micro_steps_min": float(n_micro.float().min().detach().cpu()),
             "reward/n_micro_steps_max": float(n_micro.float().max().detach().cpu()),
+            "reward/lewm_history_size": float(self.history_size),
+            "reward/lewm_warmup_steps_masked": float(warmup_steps),
+            "reward/lewm_action_normalizer_enabled": 1.0 if self.action_mean is not None else 0.0,
+            "reward/lewm_imagenet_normalize_enabled": 1.0 if bool(jepo_cfg.get("imagenet_normalize", True)) else 0.0,
             "reward/valid_step_fraction": float(step_mask.mean().detach().cpu()),
             "reward/normalize_token_rewards_applied": 1.0 if bool(jepo_cfg.get("normalize_rewards", False)) else 0.0,
         }
+        if gt_action_term_cos is not None:
+            out.update(
+                {
+                    "reward/terminal_cos_gt_action_mean": float(gt_action_term_cos.mean().detach().cpu()),
+                    "reward/terminal_cos_gt_action_std": float(gt_action_term_cos.std(unbiased=False).detach().cpu()),
+                    "reward/terminal_cos_gap_gt_minus_policy": float(
+                        (gt_action_term_cos - term_cos).mean().detach().cpu()
+                    ),
+                }
+            )
         return out
