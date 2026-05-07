@@ -24,7 +24,7 @@ data:
 
 algorithm:
   rollout_n: 4
-  num_flow_steps: 10
+  num_flow_steps: 4
   ppo_epochs: 1
   ppo_mini_batch_size: 0
   normalize_advantage: true

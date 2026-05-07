@@ -195,14 +195,13 @@ class ActorRolloutWorker:
             noise = noise.to(self.device)
 
         k_steps = self.num_flow_steps
-        dt = -1.0 / k_steps
-        time = 1.0
+        dt = 1.0 / k_steps
         x_chain = torch.empty(batch_size, k_steps + 1, self.action_horizon, self.action_dim, device=self.device, dtype=noise.dtype)
         x_chain[:, 0] = noise
         curr = noise
         with torch.no_grad():
             for k in range(k_steps):
-                t_scalar = 1.0 - time
+                t_scalar = k / k_steps
                 flow = self._predict_velocity(ctx, curr, t_scalar)
                 mean_next = curr + dt * flow
                 std, _ = self.sigma_net(pooled_ctx=ctx.pooled_ctx, noisy_actions=curr, t_scalar=t_scalar, state=ctx.state)
@@ -212,7 +211,6 @@ class ActorRolloutWorker:
                     dist = Normal(mean_next.float(), (std.float() * float(sigma_scale)).clamp_min(1e-6))
                     curr = dist.sample().to(curr.dtype)
                 x_chain[:, k + 1] = curr
-                time += dt
         return {"predicted_actions": curr.detach().cpu(), "x_chain": x_chain.detach().cpu(), "noise": noise.detach().cpu()}
 
     def _compute_log_prob(self, examples: list[dict], x_chain: torch.Tensor, return_entropy: bool, require_grad: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -221,7 +219,7 @@ class ActorRolloutWorker:
         chain = x_chain.to(self.device)
         bsz, kp1, horizon, action_dim = chain.shape
         k_steps = kp1 - 1
-        dt = -1.0 / k_steps
+        dt = 1.0 / k_steps
 
         logp = torch.zeros(bsz, horizon, action_dim, device=self.device, dtype=torch.float32)
         entropy = torch.zeros_like(logp) if return_entropy else None
